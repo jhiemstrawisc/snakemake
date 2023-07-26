@@ -28,6 +28,8 @@ from snakemake.executors.slurm.slurm_jobstep import SlurmJobstepExecutor
 from snakemake.executors.flux import FluxExecutor
 from snakemake.executors.google_lifesciences import GoogleLifeSciencesExecutor
 from snakemake.executors.ga4gh_tes import TaskExecutionServiceExecutor
+from snakemake.executors.htcondor.htcondor import HTCondorExecutor
+
 from snakemake.exceptions import RuleException, WorkflowError, print_exception
 from snakemake.common import ON_WINDOWS
 from snakemake.interfaces import JobSchedulerExecutorInterface
@@ -68,6 +70,7 @@ class JobScheduler(JobSchedulerExecutorInterface):
         touch=False,
         slurm=None,
         slurm_jobstep=None,
+        htcondor=None,
         cluster=None,
         cluster_status=None,
         cluster_config=None,
@@ -295,6 +298,31 @@ class JobScheduler(JobSchedulerExecutorInterface):
                     max_status_checks_per_second=max_status_checks_per_second,
                     keepincomplete=keepincomplete,
                 )
+        elif htcondor:
+            self._local_executor = CPUExecutor(
+                workflow,
+                dag,
+                local_cores,
+                printreason=printreason,
+                quiet=quiet,
+                printshellcmds=printshellcmds,
+                cores=local_cores,
+                keepincomplete=keepincomplete,
+            )
+            if max_status_checks_per_second > 2:
+                max_status_checks_per_second = 2
+
+            self._executor = HTCondorExecutor(
+                workflow,
+                dag,
+                cores=None,
+                printreason=printreason,
+                quiet=quiet,
+                printshellcmds=printshellcmds,
+                cluster_config=cluster_config,
+                max_status_checks_per_second=max_status_checks_per_second,
+            )
+
         elif kubernetes:
             self._local_executor = CPUExecutor(
                 workflow,

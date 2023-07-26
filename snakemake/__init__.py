@@ -105,6 +105,7 @@ def snakemake(
     keepgoing=False,
     slurm=None,
     slurm_jobstep=None,
+    htcondor=None,
     rerun_triggers=RERUN_TRIGGERS,
     cluster=None,
     cluster_config=None,
@@ -475,6 +476,7 @@ def snakemake(
         or tes
         or slurm
         or slurm_jobstep
+        or htcondor
     )
     if run_local:
         if not dryrun:
@@ -798,6 +800,7 @@ def snakemake(
                     printdag=printdag,
                     slurm=slurm,
                     slurm_jobstep=slurm_jobstep,
+                    htcondor=htcondor,
                     cluster=cluster,
                     cluster_sync=cluster_sync,
                     jobname=jobname,
@@ -2280,6 +2283,16 @@ def get_argument_parser(profiles=None):
         # mode
     )
 
+    group_htcondor = parser.add_argument_group("HTCONDOR")
+    htcondor_mode_group = group_htcondor.add_mutually_exclusive_group()
+    htcondor_mode_group.add_argument(
+        "--htcondor",
+        action="store_true",
+        help=(
+            "Execute the jobs in an HTCondor pool"
+        ),
+    )
+
     group_cluster = parser.add_argument_group("CLUSTER")
 
     # TODO extend below description to explain the wildcards that can be used
@@ -2814,6 +2827,7 @@ def main(argv=None):
         args.cluster
         or args.slurm
         or args.slurm_jobstep
+        or args.htcondor
         or args.cluster_sync
         or args.tibanna
         or args.kubernetes
@@ -3138,6 +3152,7 @@ def main(argv=None):
             keepgoing=args.keep_going,
             slurm=args.slurm,
             slurm_jobstep=args.slurm_jobstep,
+            htcondor=args.htcondor,
             rerun_triggers=args.rerun_triggers,
             cluster=args.cluster,
             cluster_config=args.cluster_config,
