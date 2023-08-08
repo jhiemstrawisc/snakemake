@@ -1,31 +1,23 @@
-
 # Try to import HTCondor and associated packages
-# try:
-#     import htcondor
-#     import classad
-# except ImportError:
-#     htcondor = None
-#     classad = None
+try:
+    import htcondor
+    import classad
+except ImportError:
+    htcondor = None
+    classad = None
 
-import htcondor
-import classad
-from random import randrange
-
-import re
-import time
+from os.path import join
 from collections import namedtuple
 import os
-#import tempfile
 import stat
 import asyncio
 import subprocess
-from snakemake.executors import ClusterExecutor #, Mode
-from snakemake.logging import logger
-#from snakemake.common import Mode
+import re
 
+from snakemake.executors import ClusterExecutor, sleep
+from snakemake.executors.common import join_cli_args, format_cli_arg
 from snakemake.logging import logger
 from snakemake.exceptions import WorkflowError
-from snakemake.executors import ClusterExecutor
 from snakemake.interfaces import (
     DAGExecutorInterface,
     ExecutorJobInterface,
@@ -34,7 +26,9 @@ from snakemake.interfaces import (
 from snakemake.resources import DefaultResources
 from snakemake.common import async_lock
 
-HTCondorJob = namedtuple("HTCondorJob", "job jobid htcondor_logfile")
+HTCondorJob = namedtuple(
+    "HTCondorJob", "job jobid htcondor_jobid htcondor_logfile callback error_callback"
+    )
 
 class HTCondorExecutor(ClusterExecutor):
     def __init__(
@@ -76,42 +70,100 @@ class HTCondorExecutor(ClusterExecutor):
             keepincomplete=keepincomplete,
         )
 
-
     def get_snakefile(self):
         assert os.path.exists(self.workflow.main_snakefile)
         return self.workflow.main_snakefile
 
-    # def get_job_args(self, job):
-    #     # Customize the job arguments as needed for HTCondor.
-    #     htcondor_args = {
-    #         "RequestMemory": "2GB",
-    #         "RequestCpus": str(self.cores),
-    #         # Additional HTCondor job options here...
-    #         "RequestDisk": "2GB",
-    #         "TransferInput": " ".join(job.input),
-    #         "ShouldTransferFiles": "YES",
+    def format_inputs(self, job):
+        input_str = job.input
 
+        # Split the string by spaces to create a list of file paths
+        input_list = str(input_str).split()
 
-    #     }
-    #     return super().get_job_args(job) + self.format_htcondor_args(htcondor_args)
+        # Join the elements of the list using ', ' as the separator
+        formatted_inputs = ', '.join(input_list)
+        return formatted_inputs
 
-    # def format_htcondor_args(self, htcondor_args):
-    #     # Format HTCondor arguments into a string that can be passed to the job script.
-    #     return " ".join(
-    #         f"{arg} = \"{val}\"" for arg, val in htcondor_args.items()
-    #     )
+    def get_job_args(self, job):
+        return super().get_job_args(job)
 
-    # def format_job_exec(self, job):
-    #     # Generate the command to execute Snakemake for each job.
-    #     return (
-    #         f"{self.get_python_executable()} -m snakemake --snakefile {self.snakefile} "
-    #         f"--cores {self.cores} {self.get_default_remote_provider_args()} "
-    #         f"{self.get_default_resources_args()} {self.get_job_args(job)} "
-    #         f"{self.get_workdir_arg()} --nolock {job.rule.name}"
-    #     )
+    def format_condor_submit(self, job, htcondor_logfile):
+        if str(self.cores) == "all":
+            self.cores = 1
+        jobscript = os.path.basename(self.get_jobscript(job))
+        job_submit = htcondor.Submit({
+            "executable": "{}".format(os.path.relpath(self.get_jobscript(job))),
+            # "executable": "{}".format("sleep.sh"),
+            "transfer_executable": "YES",
+            # Needed to set the local cache on the EP
+            "environment": "XDG_CACHE_HOME=$$(CondorScratchDir)",
+            "log": htcondor_logfile,
+            "output": self.get_jobname(job) + ".out",
+            "error": self.get_jobname(job) + ".err",
+            "request_memory": str(job.resources.get("mem_mb", 1024)) + "MB",
+            "request_cpus": str(job.resources.get("_cores", 1)),
+            # Additional HTCondor job options here...
+            "request_disk": str(job.resources.get("disk_mb", 2048)) + "MB",
+            "transfer_input_files": "{}, {}, {}, {}".format(self.get_jobscript(job),self.get_snakefile(), self.format_inputs(job), self.workflow.overwrite_configfiles[0]),
+            "should_transfer_files": "YES",
+            "when_to_transfer_output": "ON_EXIT_OR_EVICT",
+            "universe": "container",
+            "container_image": "docker://snakemake/snakemake",
+            "preserve_relative_paths": "true",     
+        })
+        return job_submit
 
-    async def _wait_for_jobs(self):
-        time.sleep(2)
+    def condor_submit_job(self, job, htcondor_logfile):
+
+        local_provider_name = htcondor.param.get('LOCAL_CREDMON_PROVIDER_NAME')
+        if local_provider_name is None:
+            print('Local provider not named, aborting.')
+            exit(1)
+        magic = f"LOCAL:{local_provider_name}"
+        binary_magic = bytes(magic, 'utf-8')
+        credd = htcondor.Credd()
+        credd.add_user_cred(htcondor.CredTypes.Kerberos, binary_magic)
+
+        submit_file = self.format_condor_submit(job, htcondor_logfile)
+        schedd = htcondor.Schedd()
+        submit_result = schedd.submit(submit_file)
+
+        return submit_result.cluster()
+
+    def format_job_exec(self, job):
+        # Generate the command to execute Snakemake for each job.
+        prefix = self.get_job_exec_prefix(job)
+        if prefix:
+            prefix += " &&"
+        suffix = self.get_job_exec_suffix(job)
+        if suffix:
+            suffix = f"&& {suffix}"
+
+        # Need a way to replace the configfile to run on the EP.
+        new_config_file = os.path.basename(self.workflow.overwrite_configfiles[0])
+        pattern = r"(--configfiles\s+)\'[^\']*\'"
+        replacement = fr"\1'{new_config_file}'"
+        modified_general_args = re.sub(pattern, replacement, self.general_args)
+
+        return join_cli_args(
+            [
+                prefix,
+                self.get_envvar_declarations(),
+                self.get_python_executable(),
+                "-m snakemake",
+                format_cli_arg("--snakefile", self.snakefile),
+                self.get_job_args(job),
+                modified_general_args,
+                suffix,
+            ]
+        )
+
+        # return (
+        #     f"{self.get_python_executable()} -m snakemake --snakefile {self.snakefile} "
+        #     f"--cores {job.resources.get('_cores', 1)} " #{self.get_default_remote_provider_args()}
+        #     f"{self.get_default_resources_args()} {self.get_job_args(job)} "
+        #     f"{self.get_workdir_arg()} --nolock {job.rule.name}"
+        # )
 
     def _set_job_resources(self, job: ExecutorJobInterface):
         """
@@ -122,84 +174,128 @@ class HTCondorExecutor(ClusterExecutor):
             from_other=self.workflow.default_resources
         )
 
-    # def status(self):
-    #     # Use condor_q to get the status of HTCondor jobs.
-    #     try:
-    #         cmd = ["condor_q", "-format", "%d ", "ClusterId", "-format", "%d ", "ProcId", "-format", "%d\n", "JobStatus"]
-    #         output = subprocess.check_output(cmd).decode().strip()
-    #     except subprocess.CalledProcessError as e:
-    #         logger.error(f"Error running condor_q: {e}")
-    #         return
+    def status(self, condor_job):
+        jobid = condor_job.jobid
+        htcondor_logfile = f".snakemake/htcondor_logs/{jobid}.log"
+        failed_states = [
+            htcondor.JobEventType.JOB_HELD,
+            htcondor.JobEventType.JOB_ABORTED,
+            htcondor.JobEventType.EXECUTABLE_ERROR,
+        ]
+        status_report = ""
+        try:
+            jel = htcondor.JobEventLog(htcondor_logfile)
+            for event in jel.events(stop_after=0):
+                if event.type in failed_states:
+                    status_report = f"Rule {condor_job.job} encountered a failure"
+                    print(status_report)
+                    return "failed"
+                elif event.type is htcondor.JobEventType.JOB_TERMINATED:
+                    if event["ReturnValue"] == 0:
+                        status_report = f"Rule {condor_job.job} completed successfully"
+                        print(status_report)
+                        return "success"
+                    status_report = f"Rule {condor_job.job} was terminated"
+                    return "failed"
+                else:
+                    if event.type is htcondor.JobEventType.EXECUTE:
+                        status_report = f"Rule {condor_job.job} is running through HTCondor with id {condor_job.htcondor_jobid}"
+                        continue
+                    if event.type is htcondor.JobEventType.SUBMIT:
+                        status_report = f"Rule {condor_job.job} was submitted to HTCondor with id {condor_job.htcondor_jobid} and is idle"
+                        continue
+                    
+        except OSError as e:
+            print("failed: {}".format(e))
+            return "failed"
+        print(status_report)
+        return "running"
 
-    #     job_statuses = {}
-    #     lines = output.splitlines()
-    #     for line in lines:
-    #         cluster_id, proc_id, status = map(int, line.split())
-    #         job_id = (cluster_id, proc_id)
-    #         job_statuses[job_id] = status
 
-    #     for job_info in self.active_jobs:
-    #         job_id = job_info.jobid
-    #         if job_id in job_statuses:
-    #             status = job_statuses[job_id]
-    #             if status == 4:  # HTCondor job completed successfully.
-    #                 self.handle_job_success(job_info.job)
-    #             elif status in [3, 5, 6, 7]:  # HTCondor job failed or was removed.
-    #                 self.handle_job_error(job_info.job)
 
-    # def cancel(self):
-    #     super().cancel()
-    #     # Cancel HTCondor jobs using condor_rm.
-    #     for job_info in self.active_jobs:
-    #         job_id = job_info.jobid
-    #         subprocess.run(["condor_rm", str(job_id)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    async def _wait_for_jobs(self):
 
-    # def handle_job_success(self, job):
-    #     super().handle_job_success(job)
-    #     # You may want to perform additional cleanup here if needed.
+        while True:
+            # always use self.lock to avoid race conditions
+            async with async_lock(self.lock):
+                if not self.wait:
+                    return
+                active_jobs = self.active_jobs
+                self.active_jobs = list()
+                still_running = list()
 
-    # def handle_job_error(self, job):
-    #     super().handle_job_error(job)
-    #     # You may want to perform additional cleanup here if needed.
-    #     # For example, handle the case when HTCondor job fails or is removed.
+            # Loop through active jobs and act on status
+            for j in active_jobs:
+                # use self.status_rate_limiter to avoid too many API calls.
+                async with self.status_rate_limiter:
+                    try:
+                        status = self.status(j)
 
-    # def get_jobname(self, job):
-    #     # Override this method to generate a unique job name for HTCondor.
-    #     # You may use job.format_wildcards to create a custom name.
-    #     return super().get_jobname(job)
+                        # The operation is done
+                        if status == "failed":
+                            j.error_callback(j.job)
+                        elif status == "success":
+                                j.callback(j.job)
+                        
+                        # The operation is still running
+                        else:
+                            still_running.append(j)
+                    except RuntimeError:
+                        # job did not complete
+                        j.error_callback(j.job)
 
-    # def get_jobscript(self, job):
-    #     f = self.get_jobname(job)
+            async with async_lock(self.lock):
+                self.active_jobs.extend(still_running)
+            await sleep()
 
-    #     if os.path.sep in f:
-    #         raise WorkflowError(
-    #             "Path separator ({}) found in job name {}. "
-    #             "This is not supported.".format(os.path.sep, f)
-    #         )
 
-    #     return os.path.join(self.tmpdir, f)
 
-    # def write_jobscript(self, job, jobscript):
-    #     exec_job = self.format_job_exec(job)
 
-    #     try:
-    #         content = self.jobscript.format(
-    #             properties=job.properties(cluster=self.cluster_params(job)),
-    #             exec_job=exec_job,
-    #         )
-    #     except KeyError as e:
-    #         if self.is_default_jobscript:
-    #             raise e
-    #         else:
-    #             raise WorkflowError(
-    #                 f"Error formatting custom jobscript {self.workflow.jobscript}: value for {e} not found.\n"
-    #                 "Make sure that your custom jobscript is defined as expected."
-    #             )
 
-    #     logger.debug(f"Jobscript:\n{content}")
-    #     with open(jobscript, "w") as f:
-    #         print(content, file=f)
-    #     os.chmod(jobscript, os.stat(jobscript).st_mode | stat.S_IXUSR | stat.S_IRUSR)
+    def cancel(self):
+        # super().cancel()
+        for job_info in self.active_jobs:
+            job_id = job_info.htcondor_jobid
+            subprocess.run(["condor_rm", str(job_id)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.shutdown()
+
+    def get_jobname(self, job):
+        # Override this method to generate a unique job name for HTCondor.
+        # You may use job.format_wildcards to create a custom name.
+        return super().get_jobname(job)
+
+    def get_jobscript(self, job):
+        f = self.get_jobname(job)
+
+        if os.path.sep in f:
+            raise WorkflowError(
+                "Path separator ({}) found in job name {}. "
+                "This is not supported.".format(os.path.sep, f)
+            )
+
+        return os.path.join(self.tmpdir, f)
+
+    def write_jobscript(self, job, jobscript):
+        exec_job = self.format_job_exec(job)
+
+        try:
+            content = self.jobscript.format(
+                properties=job.properties(cluster=self.cluster_params(job)),
+                exec_job=exec_job,
+            )
+        except KeyError as e:
+            if self.is_default_jobscript:
+                raise e
+            else:
+                raise WorkflowError(
+                    f"Error formatting custom jobscript {self.workflow.jobscript}: value for {e} not found.\n"
+                    "Make sure that your custom jobscript is defined as expected."
+                )
+
+        logger.debug(f"Jobscript:\n{content}")
+        with open(jobscript, "a") as f:
+            print(content, file=f)
+        os.chmod(jobscript, os.stat(jobscript).st_mode | stat.S_IXUSR | stat.S_IRUSR)
 
     def run(
             self,
@@ -211,478 +307,19 @@ class HTCondorExecutor(ClusterExecutor):
         """
         Submit a job to HTCondor.
         """
+
         super()._run(job)
-        # jobid = job.jobid
-        # htcondor_logfile = f".snakemake/htcondor_logs/%j.log"
-        # os.makedirs(os.path.dirname(htcondor_logfile), exist_ok=True)
+        jobid = job.jobid
+        htcondor_logfile = f".snakemake/htcondor_logs/{jobid}.log"
+        os.makedirs(os.path.dirname(htcondor_logfile), exist_ok=True)
 
-        # self.active_jobs.append(
-        #     HTCondorJob(job, jobid, htcondor_logfile)
-        # )
-                
-        command = self.format_job_exec(job)
-        print("command:", command)
-
-        # Use regex to find the part after --snakefile
-        # Use regex to find the part after --snakefile
-        match = re.search(r"--snakefile\s+'([^']+)'", command)
-
-        if match:
-            full_snakefile_path = match.group(1)
-            # Extract the filename from the path
-            filename = os.path.basename(full_snakefile_path)
-
-            # Replace the full path with just the filename
-            edited_input_string = re.sub(r"--snakefile\s+'([^']+)'", f"--snakefile '{filename}'", command)
-            print("edited command:", edited_input_string)
-        else:
-            print("Snakefile path not found.")
-
-        rand_file_suffix = randrange(10000)
-        current_directory = os.getcwd()
-        original_name = "temp-orig-snake-command-{}.sh".format(rand_file_suffix)
-        new_name = "temp-new-snake-command-{}.sh".format(rand_file_suffix)
-
-        with open(original_name, "w") as tmp_sf:
-            tmp_sf.write(command)
-                    
-        with open(new_name, "w") as tmp_sf:
-            edited_input_string = f'''#!/bin/bash
-{edited_input_string}\n'''
-            tmp_sf.write(edited_input_string)
-
-        os.chmod(new_name, 0o755) 
-
-
+        jobscript = self.get_jobscript(job)
         
-        # Now start to build HTCondor submit file for the job
-        job_submit = htcondor.Submit({
-            "executable": "{}".format(new_name),
-            "output": "foo.out",
-            "error": "foo.err",
-            "log": "foo.log",
-            "request_cpus": 1, #We'll need to parse command eventually
-            "request_memory": "128MB", #again...
-            "request_disk": "1GB",
-            "should_transfer_files": "yes",
-            #"transfer_input_files": "temp-new-snake-command, {}".format(self.get_snakefile)
-            "transfer_input_files": "{}".format(new_name),
-            "universe": "container",
-            "container_image": "docker://snakemake/snakemake",
-        })
+        self.write_jobscript(job, jobscript)
+        jobscript =  os.path.basename(jobscript)
 
-        schedd = htcondor.Schedd()
-        submit_result = schedd.submit(job_submit)
-        print(submit_result.cluster())
+        htcondor_jobid = self.condor_submit_job(job, htcondor_logfile)
 
-
-
-        print("snakefile: ", self.get_snakefile())
-
-
-
-
-
-
-
-
-
-
-
-
-
-# from collections import namedtuple
-# from io import StringIO
-# from fractions import Fraction
-# #import csv
-# import os
-# #import time
-# #import shlex
-# import subprocess
-# #import uuid
-# from snakemake.interfaces import (
-#     DAGExecutorInterface,
-#     ExecutorJobInterface,
-#     WorkflowExecutorInterface,
-# )
-
-# from snakemake.logging import logger
-# from snakemake.exceptions import WorkflowError
-# from snakemake.executors import ClusterExecutor
-# from snakemake.common import async_lock
-
-# #HTCondorJob = namedtuple("HTCondorJob", "job jobid callback error_callback htcondor_logfile")
-
-# #import tempfile
-# import stat
-# import asyncio
-# import subprocess
-# from snakemake.executors import ClusterExecutor, Mode
-# from snakemake.logging import logger
-# from snakemake.common import Mode
-
-
-
-# class HTCondorExecutor(ClusterExecutor):
-#     def __init__(
-#         self,
-#         workflow,
-#         dag,
-#         cores,
-#         jobname="snakejob.{name}.{jobid}.sh",
-#         printreason=False,
-#         quiet=False,
-#         printshellcmds=False,
-#         cluster_config=None,
-#         local_input=None,
-#         restart_times=None,
-#         assume_shared_fs=True,
-#         max_status_checks_per_second=1,
-#         disable_default_remote_provider_args=False,
-#         disable_default_resources_args=False,
-#         disable_envvar_declarations=False,
-#         keepincomplete=False,
-#     ):
-#         # from throttler import Throttler
-
-#         # local_input = local_input or []
-#         super().__init__(
-#             workflow,
-#             dag,
-#             cores,
-#             jobname=jobname,
-#             printreason=printreason,
-#             quiet=quiet,
-#             printshellcmds=printshellcmds,
-#             cluster_config=cluster_config,
-#             local_input=local_input,
-#             restart_times=restart_times,
-#             assume_shared_fs=assume_shared_fs,
-#             max_status_checks_per_second=max_status_checks_per_second,
-#             disable_default_remote_provider_args=disable_default_remote_provider_args,
-#             disable_default_resources_args=disable_default_resources_args,
-#             disable_envvar_declarations=disable_envvar_declarations,
-#             keepincomplete=keepincomplete,
-#         )
-
-#         # self.status_rate_limiter = Throttler(
-#         #     rate_limit=max_status_checks_per_second, period=1
-#         # )
-
-#     def get_job_args(self, job):
-#         # Customize the job arguments as needed for HTCondor.
-#         htcondor_args = {
-#             "RequestMemory": "2GB",
-#             "RequestCpus": str(self.cores),
-#             # Additional HTCondor job options here...
-#             "RequestDisk": "2GB",
-#             "TransferInput": " ".join(job.input),
-#             "ShouldTransferFiles": "YES",
-
-#         }
-#         return super().get_job_args(job) + self.format_htcondor_args(htcondor_args)
-
-#     def format_htcondor_args(self, htcondor_args):
-#         # Format HTCondor arguments into a string that can be passed to the job script.
-#         return " ".join(
-#             f"{arg} = \"{val}\"" for arg, val in htcondor_args.items()
-#         )
-
-#     def format_job_exec(self, job):
-#         # Generate the command to execute Snakemake for each job.
-#         return (
-#             f"{self.get_python_executable()} -m snakemake --snakefile {self.snakefile} "
-#             f"--cores {self.cores} {self.get_default_remote_provider_args()} "
-#             f"{self.get_default_resources_args()} {self.get_job_args(job)} "
-#             f"{self.get_workdir_arg()} --nolock {job.rule.name}"
-#         )
-
-#     async def _wait_for_jobs(self):
-#         while self.wait:
-#             self.status_rate_limiter.run()
-#             self.status()
-#             await asyncio.sleep(1)
-
-#     def status(self):
-#         # Use condor_q to get the status of HTCondor jobs.
-#         try:
-#             cmd = ["condor_q", "-format", "%d ", "ClusterId", "-format", "%d ", "ProcId", "-format", "%d\n", "JobStatus"]
-#             output = subprocess.check_output(cmd).decode().strip()
-#         except subprocess.CalledProcessError as e:
-#             logger.error(f"Error running condor_q: {e}")
-#             return
-
-#         job_statuses = {}
-#         lines = output.splitlines()
-#         for line in lines:
-#             cluster_id, proc_id, status = map(int, line.split())
-#             job_id = (cluster_id, proc_id)
-#             job_statuses[job_id] = status
-
-#         for job_info in self.active_jobs:
-#             job_id = job_info.jobid
-#             if job_id in job_statuses:
-#                 status = job_statuses[job_id]
-#                 if status == 4:  # HTCondor job completed successfully.
-#                     self.handle_job_success(job_info.job)
-#                 elif status in [3, 5, 6, 7]:  # HTCondor job failed or was removed.
-#                     self.handle_job_error(job_info.job)
-
-#     def cancel(self):
-#         super().cancel()
-#         # Cancel HTCondor jobs using condor_rm.
-#         for job_info in self.active_jobs:
-#             job_id = job_info.jobid
-#             subprocess.run(["condor_rm", str(job_id)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-#     def handle_job_success(self, job):
-#         super().handle_job_success(job)
-#         # You may want to perform additional cleanup here if needed.
-
-#     def handle_job_error(self, job):
-#         super().handle_job_error(job)
-#         # You may want to perform additional cleanup here if needed.
-#         # For example, handle the case when HTCondor job fails or is removed.
-
-#     def get_jobname(self, job):
-#         # Override this method to generate a unique job name for HTCondor.
-#         # You may use job.format_wildcards to create a custom name.
-#         return super().get_jobname(job)
-
-#     def get_jobscript(self, job):
-#         f = self.get_jobname(job)
-
-#         if os.path.sep in f:
-#             raise WorkflowError(
-#                 "Path separator ({}) found in job name {}. "
-#                 "This is not supported.".format(os.path.sep, f)
-#             )
-
-#         return os.path.join(self.tmpdir, f)
-
-#     def write_jobscript(self, job, jobscript):
-#         exec_job = self.format_job_exec(job)
-
-#         try:
-#             content = self.jobscript.format(
-#                 properties=job.properties(cluster=self.cluster_params(job)),
-#                 exec_job=exec_job,
-#             )
-#         except KeyError as e:
-#             if self.is_default_jobscript:
-#                 raise e
-#             else:
-#                 raise WorkflowError(
-#                     f"Error formatting custom jobscript {self.workflow.jobscript}: value for {e} not found.\n"
-#                     "Make sure that your custom jobscript is defined as expected."
-#                 )
-
-#         logger.debug(f"Jobscript:\n{content}")
-#         with open(jobscript, "w") as f:
-#             print(content, file=f)
-#         os.chmod(jobscript, os.stat(jobscript).st_mode | stat.S_IXUSR | stat.S_IRUSR)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#     def __init__(
-#         self,
-#         workflow: WorkflowExecutorInterface,
-#         dag: DAGExecutorInterface,
-#         cores,
-#         jobname="snakejob.{name}.{jobid}",
-#         printreason=False,
-#         quiet=False,
-#         printshellcmds=False,
-#         restart_times=0,
-#         max_status_checks_per_second=0.5,
-#         cluster_config=None,
-#         # Additional things to initialize, specific to HTCondor
-#     ):
-#         super().__init__(
-#             workflow,
-#             dag,
-#             cores,
-#             jobname=jobname,
-#             printreason=printreason,
-#             quiet=quiet,
-#             printshellcmds=printshellcmds,
-#             cluster_config=cluster_config,
-#             restart_times=restart_times,
-#             assume_shared_fs=False, # Do not assume a shared filesystem, always use CEDAR for file transfer
-#             max_status_checks_per_second=max_status_checks_per_second,
-#         )
-
-#         # Additional things to initialize, specific to HTCondor
-
-#     # Functions needed by every executor:
-
-#     def shutdown(self):
-#         """
-#         Not yet sure if I need this
-#         """
-#         pass
-
-#     def cancel(self):
-#         """
-#         cancel any jobs that haven't completed
-#         """
-
-#         # Flux executor example
-#         # for job in self.active_jobs:
-#         #     if not job.flux_future.done():
-#         #         flux.job.cancel(self.f, job.jobid)
-#         # self.shutdown()
-#         pass
-
-#     def _set_job_resources(self, job: ExecutorJobInterface):
-#         """
-#         Given a particular job, generate the resources that it needs,
-#         including default regions and the virtual machine configuration
-#         """
-#         pass
-
-#     def get_snakefile(self):
-#         assert os.path.exists(self.workflow.main_snakefile)
-#         return self.workflow.main_snakefile
-
-#     # def _get_jobname(self, job: ExecutorJobInterface):
-#     #     # Get the jobname
-
-#     def run(
-#         self,
-#         job: ExecutorJobInterface,
-#     ):
-#         """
-#         Submit a job to HTCondor.
-#         """
-#         super()._run(job)
-#         self.active_jobs.append(
-#             HTCondorJob(job, result["name"], jobid, callback, error_callback)
-#         )
-#     async def _wait_for_jobs(self): # This is an abstract method in the parent class
-#         """
-#         Wait for jobs to complete. This means requesting their status,
-#         and then marking them as finished when a "done" parameter
-#         shows up. Even for finished jobs, the status should still return
-#         """
-       
-
-
-
-# import os
-# import tempfile
-# import stat
-# import shutil
-# import asyncio
-# import subprocess
-# from snakemake.executors import ClusterExecutor, Mode
-# from snakemake.logging import logger
-
-# class HTCondorExecutor(ClusterExecutor):
-#     def __init__(self, workflow, dag, cores, cluster_config=None, **kwargs):
-#         super().__init__(workflow, dag, cores, cluster_config=cluster_config, **kwargs)
-
-#     def get_job_args(self, job):
-#         # Customize the job arguments as needed for HTCondor.
-#         htcondor_args = {
-#             "RequestMemory": "2GB",
-#             "RequestCpus": str(self.cores),
-#             # Additional HTCondor job options here...
-#         }
-#         return super().get_job_args(job) + self.format_htcondor_args(htcondor_args)
-
-#     def format_htcondor_args(self, htcondor_args):
-#         # Format HTCondor arguments into a string that can be passed to the job script.
-#         return " ".join(
-#             f"+{arg} = \"{val}\"" for arg, val in htcondor_args.items()
-#         )
-
-#     def format_job_exec(self, job):
-#         # Generate the command to execute Snakemake for each job.
-#         return (
-#             f"{self.get_python_executable()} -m snakemake --snakefile {self.snakefile} "
-#             f"--cores {self.cores} {self.get_default_remote_provider_args()} "
-#             f"{self.get_default_resources_args()} {self.get_job_args(job)} "
-#             f"{self.get_workdir_arg()} --nolock {job.rule.name}"
-#         )
-
-#     def get_exec_mode(self):
-#         return Mode.cluster
-
-#     async def _wait_for_jobs(self):
-#         while self.wait:
-#             # Check the status of HTCondor jobs.
-#             self.status_rate_limiter.run()
-#             self.status()
-#             await asyncio.sleep(1)
-
-#     def status(self):
-#         # Use condor_q to get the status of HTCondor jobs.
-#         try:
-#             cmd = ["condor_q", "-format", "%d ", "ClusterId", "-format", "%d ", "ProcId", "-format", "%d\n", "JobStatus"]
-#             output = subprocess.check_output(cmd).decode().strip()
-#         except subprocess.CalledProcessError as e:
-#             logger.error(f"Error running condor_q: {e}")
-#             return
-
-#         job_statuses = {}
-#         lines = output.splitlines()
-#         for line in lines:
-#             cluster_id, proc_id, status = map(int, line.split())
-#             job_id = (cluster_id, proc_id)
-#             job_statuses[job_id] = status
-
-#         for job_info in self.active_jobs:
-#             job_id = job_info.jobid
-#             if job_id in job_statuses:
-#                 status = job_statuses[job_id]
-#                 if status == 4:  # HTCondor job completed successfully.
-#                     self.handle_job_success(job_info.job)
-#                 elif status in [3, 5, 6, 7]:  # HTCondor job failed or was removed.
-#                     self.handle_job_error(job_info.job)
-
-#     def cancel(self):
-#         super().cancel()
-#         # Cancel HTCondor jobs using condor_rm.
-#         for job_info in self.active_jobs:
-#             job_id = job_info.jobid
-#             subprocess.run(["condor_rm", str(job_id)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-#     def handle_job_success(self, job):
-#         super().handle_job_success(job)
-#         # You may want to perform additional cleanup here if needed.
-
-#     def handle_job_error(self, job):
-#         super().handle_job_error(job)
-#         # You may want to perform additional cleanup here if needed.
-#         # For example, handle the case when HTCondor job fails or is removed.
-
-#     def shutdown(self):
-#         super().shutdown()
-#         # You may want to perform additional cleanup here if needed.
-
-#     def get_jobname(self, job):
-#         # Override this method to generate a unique job name for HTCondor.
-#         # You may use job.format_wildcards to create a custom name.
-#         return super().get_jobname(job)
-
-
+        self.active_jobs.append(
+            HTCondorJob(job, jobid, htcondor_jobid, htcondor_logfile, callback, error_callback)
+        )
